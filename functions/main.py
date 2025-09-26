@@ -2,7 +2,8 @@
 # To get started, simply uncomment the below code or create your own.
 # Deploy with `firebase deploy`
 
-from firebase_functions import https_fn, firestore_fn, scheduler_fn
+from firebase_functions import https_fn, firestore_fn, scheduler_fn, options
+from firebase_admin import storage
 # from firebase_functions.options import set_global_options
 from firebase_admin import initialize_app, firestore
 import google.cloud.firestore
@@ -61,9 +62,25 @@ def makeuppercase(event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None
     upper = original.upper()
     event.data.reference.update({"uppercase": upper})
 
+def _get_document_id(record: dict) -> str:
+    """
+    Determines a deterministic document ID from a record.
+    Tries common ID fields first, otherwise falls back to a hash of the record.
+    """
+    # Try to find a natural primary key in common fields
+    for candidate in ("site_id", "objectid", "object_id", "id", "uniqueid", "the_geom_id"):
+        if candidate in record:
+            return str(record[candidate])
+    
+    # Deterministic fallback if no common ID field is found
+    return hashlib.md5(
+        json.dumps(record, sort_keys=True).encode()
+    ).hexdigest()
+
 @scheduler_fn.on_schedule(
     schedule="every day 09:00",
-    timeout_sec=540
+    timeout_sec=540,
+    max_instances=1,
 )
 def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
 # @https_fn.on_request()
@@ -83,6 +100,8 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
     limit = 500
     offset = 0
     total_written = 0
+    total_skipped = 0
+    total_processed = 0
 
     firestore_client: google.cloud.firestore.Client = firestore.client()
     collection = firestore_client.collection("city_bike_data")
@@ -107,26 +126,39 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
             print("No more records found or unexpected payload. Finishing.")
             break
 
+        # For efficiency, get all document IDs from the payload first.
+        doc_ids_in_payload = [_get_document_id(rec) for rec in payload if isinstance(rec, dict)]
+        if not doc_ids_in_payload:
+            continue
+
+        # Firestore's 'in' query is limited to 30 values. We must chunk the IDs.
+        chunk_size = 30
+        id_chunks = [doc_ids_in_payload[i:i + chunk_size] for i in range(0, len(doc_ids_in_payload), chunk_size)]
+
+        existing_docs = {}
+        for chunk in id_chunks:
+            # Fetch existing documents for the current chunk.
+            chunk_docs_ref = collection.where("__name__", "in", chunk).stream()
+            for doc in chunk_docs_ref:
+                existing_docs[doc.id] = doc.to_dict()
+
         batch = firestore_client.batch()
         batch_count = 0
 
         for rec in payload:
             if not isinstance(rec, dict):
                 continue
+            
+            total_processed += 1
+            doc_id = _get_document_id(rec)
 
-            # Try to find a natural primary key in common fields, otherwise hash the record
-            doc_id = None
-            for candidate in ("site_id", "objectid", "object_id", "id", "uniqueid", "the_geom_id"):
-                if candidate in rec:
-                    doc_id = str(rec[candidate])
-                    break
-            if doc_id is None:
-                # deterministic fallback
-                doc_id = hashlib.md5(json.dumps(rec, sort_keys=True).encode()).hexdigest()
-
-            doc_ref = collection.document(doc_id)
-            batch.set(doc_ref, rec)
-            batch_count += 1
+            # Only write if the document is new or if the data has changed.
+            if doc_id not in existing_docs or existing_docs[doc_id] != rec:
+                doc_ref = collection.document(doc_id)
+                batch.set(doc_ref, rec)
+                batch_count += 1
+            else:
+                total_skipped += 1
 
         if batch_count > 0:
             try:
@@ -139,5 +171,28 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
 
         offset += limit
 
-    print(f"Finished writing {total_written} documents to 'city_bike_data'.")
+    print(f"Finished. Processed: {total_processed}, Written: {total_written}, Skipped: {total_skipped}.")
     # return https_fn.Response(f"Bikes data is updated.")
+
+
+@https_fn.on_request()
+def count_bike_data(req: https_fn.Request) -> https_fn.Response:
+    """
+    Counts and returns the total number of documents in the 'city_bike_data'
+    collection using an efficient aggregation query.
+    """
+    try:
+        firestore_client: google.cloud.firestore.Client = firestore.client()
+        collection_ref = firestore_client.collection("city_bike_data")
+
+        # Use the .count() aggregation for an efficient query.
+        count_query = collection_ref.count()
+        result = count_query.get()
+        # The result is a list containing one CountAggregationResult object.
+        count = result[0][0].value
+
+        response_data = {"collection": "city_bike_data", "count": count}
+        return https_fn.Response(json.dumps(response_data), mimetype="application/json")
+    except Exception as e:
+        print(f"Error counting documents: {e}")
+        return https_fn.Response(f"Error counting documents: {e}", status=500)
