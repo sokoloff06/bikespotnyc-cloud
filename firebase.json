@@ -7,7 +7,6 @@
   },
   "functions": [
     {
-      "source": "functions",
       "codebase": "default",
       "ignore": [
         "venv",
@@ -16,6 +15,7 @@
         "firebase-debug.*.log",
         "*.local"
       ],
+      "source": "functions",
       "runtime": "python313"
     }
   ],
@@ -32,6 +32,12 @@
     "ui": {
       "enabled": true
     },
-    "singleProjectMode": true
+    "singleProjectMode": true,
+    "storage": {
+      "port": 9199
+    }
+  },
+  "storage": {
+    "rules": "storage.rules"
   }
 }
