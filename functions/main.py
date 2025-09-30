@@ -1,17 +1,15 @@
 # Welcome to Cloud Functions for Firebase for Python!
 # To get started, simply uncomment the below code or create your own.
 # Deploy with `firebase deploy`
+import os
 
-from firebase_functions import https_fn, firestore_fn, scheduler_fn, options
+from firebase_functions import https_fn, scheduler_fn, options
 from firebase_admin import storage
 # from firebase_functions.options import set_global_options
-from firebase_admin import initialize_app, firestore
-import google.cloud.firestore
+from firebase_admin import initialize_app
 import requests
 import json
-import hashlib
 import tempfile
-import os
 
 # For cost control, you can set the maximum number of containers that can be
 # running at the same time. This helps mitigate the impact of unexpected
@@ -19,75 +17,13 @@ import os
 # limit. You can override the limit for each function using the max_instances
 # parameter in the decorator, e.g. @https_fn.on_request(max_instances=5).
 # set_global_options(max_instances=10)
+storage_bucket_name = 'bikepot-nyc'
 
 app = initialize_app()
-#
-#
-# @https_fn.on_request()
-# def on_request_example(req: https_fn.Request) -> https_fn.Response:
-#     return https_fn.Response("Hello world!")
 
-@https_fn.on_request()
-def addmessage(req: https_fn.Request) -> https_fn.Response:
-    """Take the text parameter passed to this HTTP endpoint and insert it into
-    a new document in the messages collection."""
-    # Grab the text parameter.
-    original = req.args.get("text")
-    if original is None:
-        return https_fn.Response("No text parameter provided", status=400)
-
-    firestore_client: google.cloud.firestore.Client = firestore.client()
-
-    # Push the new message into Cloud Firestore using the Firebase Admin SDK.
-    _, doc_ref = firestore_client.collection("messages").add({"original": original})
-
-    # Send back a message that we've successfully written the message
-    return https_fn.Response(f"Message with ID {doc_ref.id} added.")
-
-@firestore_fn.on_document_created(document="messages/{pushId}")
-def makeuppercase(event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None]) -> None:
-    """Listens for new documents to be added to /messages. If the document has
-    an "original" field, creates an "uppercase" field containg the contents of
-    "original" in upper case."""
-
-    # Get the value of "original" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("original")
-    except KeyError:
-        # No "original" field, so do nothing.
-        return
-
-    # Set the "uppercase" field.
-    print(f"Uppercasing {event.params['pushId']}: {original}")
-    upper = original.upper()
-    event.data.reference.update({"uppercase": upper})
-
-def _get_document_id(record: dict) -> str:
+def _fetch_and_upload_data():
     """
-    Determines a deterministic document ID from a record.
-    Tries common ID fields first, otherwise falls back to a hash of the record.
-    """
-    # Try to find a natural primary key in common fields
-    for candidate in ("site_id", "objectid", "object_id", "id", "uniqueid", "the_geom_id"):
-        if candidate in record:
-            return str(record[candidate])
-    
-    # Deterministic fallback if no common ID field is found
-    return hashlib.md5(
-        json.dumps(record, sort_keys=True).encode()
-    ).hexdigest()
-
-@scheduler_fn.on_schedule(
-    schedule="every day 09:00",
-    timeout_sec=540,
-    max_instances=1,
-    memory=options.MemoryOption.GB_1, # Increased memory for in-memory aggregation
-)
-def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
-    """
-    Fetch all bike parking data from the NYC Open Data endpoint daily,
+    Core logic to fetch all bike parking data from the NYC Open Data endpoint,
     aggregate it into a single JSON file, and upload it to Cloud Storage.
 
     - Uses the provided app token and paginates through the dataset in batches.
@@ -141,7 +77,6 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
     print(f"Total records fetched: {len(all_records)}. Preparing to upload to Cloud Storage.")
 
     try:
-        # Get the default bucket
         bucket = storage.bucket()
         blob = bucket.blob("city_bike_data/all_spots.json")
 
@@ -156,14 +91,8 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
         # Upload from the temporary file
         blob.upload_from_filename(tmp_path, content_type="application/json")
 
-        # The local emulator does not support ACLs, so we skip making the blob public.
-        # In production, this makes the file publicly readable.
-        if not is_emulator:
-            blob.make_public()
-            print(f"Successfully uploaded data to {blob.public_url}")
-        else:
-            # In the emulator, the public URL isn't directly available in the same way.
-            print(f"Successfully uploaded data to emulator. Object path: {blob.name}")
+        # The public URL is available if the object is public (via bucket IAM policy).
+        print(f"Successfully uploaded data to {blob.public_url}")
 
     except Exception as e:
         print(f"Error uploading to Cloud Storage: {e}")
@@ -171,6 +100,45 @@ def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
         # Clean up the temporary file
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+@scheduler_fn.on_schedule(
+    schedule="every day 09:00",
+    timeout_sec=540,
+    max_instances=1,
+    memory=options.MemoryOption.GB_1, # Increased memory for in-memory aggregation
+)
+def fetch_nyc_open_data_daily(event: scheduler_fn.ScheduledEvent) -> None:
+    """
+    A scheduled function that triggers the data fetch and upload process.
+    """
+    print("Scheduled data fetch triggered.")
+    _fetch_and_upload_data()
+
+
+# This is a helper function for easy debugging in the emulator.
+# It's a good practice to wrap it in an emulator check so it doesn't deploy.
+if os.environ.get("FUNCTIONS_EMULATOR") == "true":
+    # Global flag to ensure the debugger is initialized only once per process.
+    _debugger_initialized = False
+
+    @https_fn.on_request()
+    def debug_fetch_data(req: https_fn.Request) -> https_fn.Response:
+        """HTTP-triggered wrapper to run the data fetch for debugging."""
+        import debugpy
+        global _debugger_initialized
+
+        # Initialize the debugger only on the first run of this function in the process.
+        if not _debugger_initialized:
+            _debugger_initialized = True
+            print("Debugger active. Waiting for client to attach on port 5678...")
+            # Using 0.0.0.0 is robust for containerized environments like the emulator.
+            debugpy.listen(("0.0.0.0", 5678))
+            debugpy.wait_for_client()
+            print("Debugger attached.")
+        debugpy.breakpoint
+        print("Debug HTTP endpoint triggered. Starting data fetch.")
+        _fetch_and_upload_data()
+        return https_fn.Response("Debug fetch process initiated. Check logs for details.")
 
 
 @https_fn.on_request()
@@ -198,7 +166,6 @@ def count_bike_spots(req: https_fn.Request) -> https_fn.Response:
     in Cloud Storage and returns the count.
     """
     try:
-        # Get the default bucket
         bucket = storage.bucket()
         blob = bucket.blob("city_bike_data/all_spots.json")
 
