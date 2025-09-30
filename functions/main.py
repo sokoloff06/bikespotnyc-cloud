@@ -17,7 +17,6 @@ import tempfile
 # limit. You can override the limit for each function using the max_instances
 # parameter in the decorator, e.g. @https_fn.on_request(max_instances=5).
 # set_global_options(max_instances=10)
-storage_bucket_name = 'bikepot-nyc'
 
 app = initialize_app()
 
@@ -77,9 +76,7 @@ def _fetch_and_upload_data():
     print(f"Total records fetched: {len(all_records)}. Preparing to upload to Cloud Storage.")
 
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob("city_bike_data/all_spots.json")
-
+        blob = getBlob()
         # Use a temporary file to handle large data, which is more memory-efficient
         # and avoids payload size limits in the local emulator.
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as tmp:
@@ -147,8 +144,7 @@ def get_bike_data_url(req: https_fn.Request) -> https_fn.Response:
     Returns the public download URL for the aggregated bike data JSON file.
     """
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob("city_bike_data/all_spots.json")
+        blob = getBlob()
         if not blob.exists():
             return https_fn.Response("Bike data file not found. It may not have been generated yet.", status=404)
         
@@ -158,6 +154,11 @@ def get_bike_data_url(req: https_fn.Request) -> https_fn.Response:
         print(f"Error getting blob URL: {e}")
         return https_fn.Response(f"Error getting blob URL: {e}", status=500)
 
+def getBlob():
+    storage_bucket_name = 'bikespot-nyc.firebasestorage.app'
+    bucket = storage.bucket(storage_bucket_name)
+    blob = bucket.blob("files/bike_spots.json")
+    return blob
 
 @https_fn.on_request()
 def count_bike_spots(req: https_fn.Request) -> https_fn.Response:
@@ -166,9 +167,7 @@ def count_bike_spots(req: https_fn.Request) -> https_fn.Response:
     in Cloud Storage and returns the count.
     """
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob("city_bike_data/all_spots.json")
-
+        blob = getBlob
         if not blob.exists():
             return https_fn.Response("Bike data file not found. It may not have been generated yet.", status=404)
 
