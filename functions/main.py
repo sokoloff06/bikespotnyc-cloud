@@ -195,6 +195,7 @@ def getBlob(file_path: str):
     blob = bucket.blob(file_path)
     return blob
 
+# Use ?format=json or geojson to make request
 @https_fn.on_request()
 def count_bike_spots(req: https_fn.Request) -> https_fn.Response:
     """
